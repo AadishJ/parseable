@@ -28,16 +28,15 @@ use crate::{
     },
     storage::ObjectStorageError,
     validator::{self, error::UsernameValidationError},
+    error_response::error_json, // <-- Add this import
 };
 use actix_web::{
     HttpResponse, Responder,
-    http::header::ContentType,
     web::{self, Path},
 };
 use http::StatusCode;
 use itertools::Itertools;
 use serde::Serialize;
-use serde_json::json;
 use tokio::sync::Mutex;
 
 use super::modal::utils::rbac_utils::{get_metadata, put_metadata};
@@ -440,24 +439,35 @@ impl actix_web::ResponseError for RBACError {
 
     fn error_response(&self) -> actix_web::HttpResponse<actix_web::body::BoxBody> {
         match self {
+            RBACError::ValidationError(e) => e.error_response(), // Delegate to UsernameValidationError
             RBACError::RolesNotAssigned(obj) => actix_web::HttpResponse::build(self.status_code())
-                .insert_header(ContentType::plaintext())
-                .json(json!({
-                    "roles_not_assigned": obj
-                })),
+                .content_type("application/json")
+                .body(error_json(
+                    "RBACError",
+                    &format!("Roles not assigned: {:?}", obj),
+                    self.status_code(),
+                )),
             RBACError::RolesDoNotExist(obj) => actix_web::HttpResponse::build(self.status_code())
-                .insert_header(ContentType::plaintext())
-                .json(json!({
-                    "non_existent_roles": obj
-                })),
-            RBACError::InvalidUserGroupRequest(obj) => {
-                actix_web::HttpResponse::build(self.status_code())
-                    .insert_header(ContentType::plaintext())
-                    .json(obj)
-            }
+                .content_type("application/json")
+                .body(error_json(
+                    "RBACError",
+                    &format!("Non-existent roles: {:?}", obj),
+                    self.status_code(),
+                )),
+            RBACError::InvalidUserGroupRequest(obj) => actix_web::HttpResponse::build(self.status_code())
+                .content_type("application/json")
+                .body(error_json(
+                    "RBACError",
+                    &format!("Invalid user group request: {:?}", obj),
+                    self.status_code(),
+                )),
             _ => actix_web::HttpResponse::build(self.status_code())
-                .insert_header(ContentType::plaintext())
-                .body(self.to_string()),
+                .content_type("application/json")
+                .body(error_json(
+                    "RBACError",
+                    &self.to_string(),
+                    self.status_code(),
+                )),
         }
     }
 }

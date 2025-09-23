@@ -18,15 +18,13 @@
 
 use std::collections::HashSet;
 
-use error::HotTierValidationError;
+use error::{HotTierValidationError, StreamNameValidationError, UsernameValidationError};
 use once_cell::sync::Lazy;
-
-use self::error::{StreamNameValidationError, UsernameValidationError};
 use crate::hottier::MIN_STREAM_HOT_TIER_SIZE_BYTES;
 use crate::storage::StreamType;
 use crate::utils::human_size::bytes_to_human_size;
+use crate::impl_api_response_error;
 
-// Add more sql keywords here in lower case
 const DENIED_NAMES: &[&str] = &[
     "select", "from", "where", "group", "by", "order", "limit", "offset", "join", "and", "sql",
 ];
@@ -146,7 +144,10 @@ pub fn hot_tier(size: &str) -> Result<(), HotTierValidationError> {
 
     Ok(())
 }
+
 pub mod error {
+    use actix_web::http::StatusCode;
+    use crate::error_response::ApiError;
 
     #[derive(Debug, thiserror::Error)]
     pub enum AlertValidationError {
@@ -164,6 +165,11 @@ pub mod error {
         NoTarget,
     }
 
+    impl ApiError for AlertValidationError {
+        fn error_type(&self) -> &'static str { "AlertValidationError" }
+        fn error_code(&self) -> StatusCode { StatusCode::BAD_REQUEST }
+    }
+
     #[derive(Debug, thiserror::Error)]
     pub enum StreamNameValidationError {
         #[error("Stream name cannot be empty")]
@@ -178,6 +184,11 @@ pub mod error {
             "The stream {0} is reserved for internal use and cannot be used for user defined streams"
         )]
         InternalStream(String),
+    }
+
+    impl ApiError for StreamNameValidationError {
+        fn error_type(&self) -> &'static str { "StreamNameValidationError" }
+        fn error_code(&self) -> StatusCode { StatusCode::BAD_REQUEST }
     }
 
     #[derive(Debug, thiserror::Error)]
@@ -202,6 +213,11 @@ pub mod error {
         ReservedName,
     }
 
+    impl ApiError for UsernameValidationError {
+        fn error_type(&self) -> &'static str { "UsernameValidationError" }
+        fn error_code(&self) -> StatusCode { StatusCode::BAD_REQUEST }
+    }
+
     #[derive(Debug, thiserror::Error)]
     pub enum HotTierValidationError {
         #[error("Please provide size in bytes")]
@@ -219,4 +235,15 @@ pub mod error {
         #[error("Hot tier not found for stream {0}")]
         NotFound(String),
     }
+
+    impl ApiError for HotTierValidationError {
+        fn error_type(&self) -> &'static str { "HotTierValidationError" }
+        fn error_code(&self) -> StatusCode { StatusCode::BAD_REQUEST }
+    }
 }
+
+// Use the macro to implement ResponseError for all error types
+impl_api_response_error!(error::AlertValidationError);
+impl_api_response_error!(error::StreamNameValidationError);
+impl_api_response_error!(error::UsernameValidationError);
+impl_api_response_error!(error::HotTierValidationError);
