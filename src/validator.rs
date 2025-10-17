@@ -166,8 +166,20 @@ pub mod error {
     }
 
     impl ApiError for AlertValidationError {
-        fn error_type(&self) -> &'static str { "AlertValidationError" }
-        fn error_code(&self) -> StatusCode { StatusCode::BAD_REQUEST }
+        fn error_type(&self) -> &'static str {
+            "AlertValidationError"
+        }
+        fn error_code(&self) -> StatusCode {
+            match self {
+                AlertValidationError::EmptyName
+                | AlertValidationError::EmptyMessage
+                | AlertValidationError::EmptyRuleField
+                | AlertValidationError::InvalidRuleRepeat
+                | AlertValidationError::NoTarget => StatusCode::BAD_REQUEST,
+
+                AlertValidationError::ExistingName => StatusCode::CONFLICT,
+            }
+        }
     }
 
     #[derive(Debug, thiserror::Error)]
@@ -187,8 +199,21 @@ pub mod error {
     }
 
     impl ApiError for StreamNameValidationError {
-        fn error_type(&self) -> &'static str { "StreamNameValidationError" }
-        fn error_code(&self) -> StatusCode { StatusCode::BAD_REQUEST }
+        fn error_type(&self) -> &'static str {
+            "StreamNameValidationError"
+        }
+        fn error_code(&self) -> StatusCode {
+            match self {
+                // Client sent invalid/malformed input - 400 Bad Request
+                StreamNameValidationError::EmptyName
+                | StreamNameValidationError::NameWhiteSpace(_)
+                | StreamNameValidationError::NameSpecialChar { .. }
+                | StreamNameValidationError::SQLKeyword(_) => StatusCode::BAD_REQUEST,
+
+                // Attempting to use forbidden/reserved resource - 403 Forbidden
+                StreamNameValidationError::InternalStream(_) => StatusCode::FORBIDDEN,
+            }
+        }
     }
 
     #[derive(Debug, thiserror::Error)]
@@ -214,8 +239,23 @@ pub mod error {
     }
 
     impl ApiError for UsernameValidationError {
-        fn error_type(&self) -> &'static str { "UsernameValidationError" }
-        fn error_code(&self) -> StatusCode { StatusCode::BAD_REQUEST }
+        fn error_type(&self) -> &'static str {
+            "UsernameValidationError"
+        }
+        fn error_code(&self) -> StatusCode {
+            match self {
+                // Client sent invalid/malformed input - 400 Bad Request
+                UsernameValidationError::InvalidLength
+                | UsernameValidationError::SpecialChar
+                | UsernameValidationError::InvalidStartChar
+                | UsernameValidationError::InvalidEndChar
+                | UsernameValidationError::InvalidCharacter
+                | UsernameValidationError::ConsecutiveSpecialChars => StatusCode::BAD_REQUEST,
+
+                // Attempting to use forbidden/reserved username - 403 Forbidden
+                UsernameValidationError::ReservedName => StatusCode::FORBIDDEN,
+            }
+        }
     }
 
     #[derive(Debug, thiserror::Error)]
@@ -237,8 +277,21 @@ pub mod error {
     }
 
     impl ApiError for HotTierValidationError {
-        fn error_type(&self) -> &'static str { "HotTierValidationError" }
-        fn error_code(&self) -> StatusCode { StatusCode::BAD_REQUEST }
+        fn error_type(&self) -> &'static str {
+            "HotTierValidationError"
+        }
+        fn error_code(&self) -> StatusCode {
+            match self {
+                // Client sent invalid data - 400 Bad Request
+                HotTierValidationError::InvalidFormat
+                | HotTierValidationError::Size(_)
+                | HotTierValidationError::NotValidDuration(_)
+                | HotTierValidationError::OutOfRange(_) => StatusCode::BAD_REQUEST,
+
+                // Resource doesn't exist - 404 Not Found
+                HotTierValidationError::NotFound(_) => StatusCode::NOT_FOUND,
+            }
+        }
     }
 }
 
