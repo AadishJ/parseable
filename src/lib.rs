@@ -49,6 +49,7 @@ pub mod sync;
 pub mod users;
 pub mod utils;
 pub mod validator;
+pub mod error_response;
 
 use std::time::Duration;
 

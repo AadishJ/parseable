@@ -19,6 +19,8 @@
 use std::collections::{HashMap, HashSet};
 
 use crate::{
+    error_response::ApiError,
+    impl_api_response_error,
     rbac::{
         self, Users,
         map::{read_user_groups, roles, users},
@@ -30,14 +32,12 @@ use crate::{
     validator::{self, error::UsernameValidationError},
 };
 use actix_web::{
+    http::StatusCode,
     HttpResponse, Responder,
-    http::header::ContentType,
     web::{self, Path},
 };
-use http::StatusCode;
 use itertools::Itertools;
 use serde::Serialize;
-use serde_json::json;
 use tokio::sync::Mutex;
 
 use super::modal::utils::rbac_utils::{get_metadata, put_metadata};
@@ -415,52 +415,45 @@ pub enum RBACError {
     InvalidDeletionRequest(String),
 }
 
-impl actix_web::ResponseError for RBACError {
-    fn status_code(&self) -> http::StatusCode {
-        match self {
-            Self::UserExists(_) => StatusCode::BAD_REQUEST,
-            Self::UserDoesNotExist => StatusCode::NOT_FOUND,
-            Self::SerdeError(_) => StatusCode::BAD_REQUEST,
-            Self::ValidationError(_) => StatusCode::BAD_REQUEST,
-            Self::ObjectStorageError(_) => StatusCode::INTERNAL_SERVER_ERROR,
-            Self::Network(_) => StatusCode::BAD_GATEWAY,
-            Self::Anyhow(_) => StatusCode::INTERNAL_SERVER_ERROR,
-            Self::RoleValidationError => StatusCode::BAD_REQUEST,
-            Self::UserGroupExists(_) => StatusCode::BAD_REQUEST,
-            Self::UserGroupDoesNotExist(_) => StatusCode::BAD_REQUEST,
-            Self::RolesDoNotExist(_) => StatusCode::BAD_REQUEST,
-            Self::RolesNotAssigned(_) => StatusCode::BAD_REQUEST,
-            Self::InvalidUserGroupRequest(_) => StatusCode::BAD_REQUEST,
-            Self::InvalidSyncOperation(_) => StatusCode::BAD_REQUEST,
-            Self::UserGroupNotEmpty(_) => StatusCode::BAD_REQUEST,
-            Self::ResourceInUse(_) => StatusCode::BAD_REQUEST,
-            Self::InvalidDeletionRequest(_) => StatusCode::BAD_REQUEST,
-        }
+impl ApiError for RBACError {
+    fn error_type(&self) -> &'static str {
+        "RBACError"
     }
 
-    fn error_response(&self) -> actix_web::HttpResponse<actix_web::body::BoxBody> {
+    fn error_code(&self) -> StatusCode {
         match self {
-            RBACError::RolesNotAssigned(obj) => actix_web::HttpResponse::build(self.status_code())
-                .insert_header(ContentType::plaintext())
-                .json(json!({
-                    "roles_not_assigned": obj
-                })),
-            RBACError::RolesDoNotExist(obj) => actix_web::HttpResponse::build(self.status_code())
-                .insert_header(ContentType::plaintext())
-                .json(json!({
-                    "non_existent_roles": obj
-                })),
-            RBACError::InvalidUserGroupRequest(obj) => {
-                actix_web::HttpResponse::build(self.status_code())
-                    .insert_header(ContentType::plaintext())
-                    .json(obj)
-            }
-            _ => actix_web::HttpResponse::build(self.status_code())
-                .insert_header(ContentType::plaintext())
-                .body(self.to_string()),
+            // Bad input/validation errors - 400 Bad Request
+            Self::SerdeError(_)
+            | Self::RoleValidationError
+            | Self::RolesNotAssigned(_)
+            | Self::InvalidUserGroupRequest(_)
+            | Self::InvalidSyncOperation(_)
+            | Self::InvalidDeletionRequest(_) => StatusCode::BAD_REQUEST,
+
+            // Delegated validation - uses child error's code
+            Self::ValidationError(e) => e.error_code(),
+
+            // Resource not found - 404 Not Found
+            Self::UserDoesNotExist
+            | Self::UserGroupDoesNotExist(_)
+            | Self::RolesDoNotExist(_) => StatusCode::NOT_FOUND,
+
+            // Resource conflicts - 409 Conflict
+            Self::UserExists(_)
+            | Self::UserGroupExists(_)
+            | Self::UserGroupNotEmpty(_)
+            | Self::ResourceInUse(_) => StatusCode::CONFLICT,
+
+            // Server/infrastructure errors - 500 Internal Server Error
+            Self::ObjectStorageError(_) | Self::Anyhow(_) => StatusCode::INTERNAL_SERVER_ERROR,
+
+            // Gateway errors - 502 Bad Gateway
+            Self::Network(_) => StatusCode::BAD_GATEWAY,
         }
     }
 }
+
+impl_api_response_error!(RBACError);
 
 #[derive(Serialize)]
 #[serde(rename = "camelCase")]
