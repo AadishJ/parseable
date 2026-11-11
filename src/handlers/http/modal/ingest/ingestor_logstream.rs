@@ -18,14 +18,16 @@
 
 use actix_web::http::StatusCode;
 use actix_web::{
-    HttpRequest, Responder,
+    HttpRequest, HttpResponse, Responder,
     web::{Json, Path},
 };
 use bytes::Bytes;
 use tokio::sync::Mutex;
-use tracing::warn;
 
-use crate::option::Mode;
+use crate::storage::object_storage::{
+    STREAM_DELETION_ID_HEADER, StreamDeletionTombstone, prepare_stream_deletion,
+    read_stream_deletion,
+};
 use crate::{
     catalog::remove_manifest_from_snapshot,
     handlers::http::logstream::error::StreamError,
@@ -79,40 +81,51 @@ pub async fn delete(
 ) -> Result<impl Responder, StreamError> {
     let stream_name = stream_name.into_inner();
     let tenant_id = get_tenant_id_from_request(&req);
-    // The querier owns the tombstone and object-storage deletion. This handler
-    // handles its notification locally, holding off recreation through cleanup.
     let _creation_guard = CREATE_STREAM_LOCK.lock().await;
+    let deletion_id = req
+        .headers()
+        .get(STREAM_DELETION_ID_HEADER)
+        .and_then(|id| id.to_str().ok())
+        .ok_or_else(|| StreamError::Custom {
+            msg: "Missing deletion acknowledgement ID".to_owned(),
+            status: StatusCode::BAD_REQUEST,
+        })?;
+    let storage = PARSEABLE.storage.get_object_store();
+    let marker = read_stream_deletion(storage.as_ref(), &stream_name, &tenant_id)
+        .await?
+        .ok_or_else(|| StreamError::Custom {
+            msg: "Deletion is no longer active".to_owned(),
+            status: StatusCode::CONFLICT,
+        })?;
+    let deletion: StreamDeletionTombstone = serde_json::from_slice(&marker)?;
+    if deletion.id != deletion_id || !deletion.participants_sealed {
+        return Err(StreamError::Custom {
+            msg: "Stale or unsealed deletion acknowledgement request".to_owned(),
+            status: StatusCode::CONFLICT,
+        });
+    }
 
-    let stream_dir = {
-        // Reject new ingestion before waiting for active local operations.
-        let stream_dir = PARSEABLE.get_stream(&stream_name, &tenant_id)?;
-        stream_dir.mark_deleting();
-        stream_dir
-    };
-
-    // On ingest/standalone nodes, wait for participating ingestion and local
-    // sync, finalize writers, then remove staging and reset stats. Cleanup is
-    // synchronous here; reconciliation retries it before evicting a stale entry.
-    if (PARSEABLE.options.mode == Mode::Ingest || PARSEABLE.options.mode == Mode::All)
-        && let Err(err) = stream_dir.remove_staging(&tenant_id).await
+    prepare_stream_deletion(&stream_name, &tenant_id)
+        .await
+        .map_err(|err| StreamError::Custom {
+            msg: format!("Failed to prepare deletion of {stream_name}: {err}"),
+            status: StatusCode::INTERNAL_SERVER_ERROR,
+        })?;
+    if read_stream_deletion(storage.as_ref(), &stream_name, &tenant_id)
+        .await?
+        .as_ref()
+        != Some(&marker)
     {
-        warn!(
-            "failed to delete local data for stream {} with error {err}. Clean {} manually",
-            stream_name,
-            stream_dir.data_path.to_string_lossy()
-        )
+        return Err(StreamError::Custom {
+            msg: "Deletion changed during acknowledgement".to_owned(),
+            status: StatusCode::CONFLICT,
+        });
     }
-    if let Err(err) = crate::stats::delete_stats(&stream_name, "json", &tenant_id) {
-        warn!("failed to clear stats for deleted stream {stream_name}: {err}");
-    }
-    // Keep the old entry marked deleting until the querier finishes deleting
-    // object storage. Once the tombstone is gone, reconciliation or recreation
-    // self-healing cleans any remaining staging and evicts the entry. Evicting
-    // here would let requests lose the local guard while deletion is ongoing.
-    Ok((
-        format!("log stream {stream_name} deletion started"),
-        StatusCode::ACCEPTED,
-    ))
+    // Keep resident handles marked deleting. Startup also checks tombstones
+    // before loading streams, so a restart cannot reactivate this deletion.
+    Ok(HttpResponse::Accepted()
+        .insert_header((STREAM_DELETION_ID_HEADER, deletion_id))
+        .body(format!("log stream {stream_name} deletion prepared")))
 }
 
 pub async fn put_stream(

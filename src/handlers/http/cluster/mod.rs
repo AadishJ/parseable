@@ -874,40 +874,178 @@ pub async fn fetch_stats_from_ingestors(
     Ok(vec![qs])
 }
 
-/// send a delete stream request to all ingestors
+/// Unlike best-effort cluster broadcasts, deletion cannot skip invalid or
+/// unreachable registered participants.
+async fn registered_deletion_ingestors(
+    tenant_id: &Option<String>,
+) -> Result<Vec<IngestorMetadata>, StreamError> {
+    PARSEABLE
+        .metastore
+        .get_node_metadata(NodeType::Ingestor, tenant_id)
+        .await?
+        .iter()
+        .map(|bytes| serde_json::from_slice(bytes).map_err(StreamError::from))
+        .collect()
+}
+
+pub async fn new_stream_deletion(
+    tenant_id: &Option<String>,
+) -> Result<crate::storage::object_storage::StreamDeletionTombstone, StreamError> {
+    let nodes = registered_deletion_ingestors(tenant_id).await?;
+    Ok(
+        crate::storage::object_storage::StreamDeletionTombstone::new(
+            nodes.into_iter().map(|node| node.node_id).collect(),
+        ),
+    )
+}
+
+pub async fn acknowledge_stream_deletion(
+    stream_name: &str,
+    tenant_id: &Option<String>,
+    deletion: &crate::storage::object_storage::StreamDeletionTombstone,
+) -> Result<(), StreamError> {
+    let nodes = registered_deletion_ingestors(tenant_id).await?;
+    let participants = deletion_participants(&nodes, deletion)?;
+    let results = futures::future::join_all(participants.into_iter().map(|node| {
+        let url = format!(
+            "{}{}/logstream/{stream_name}/sync",
+            node.domain_name,
+            base_path_without_preceding_slash()
+        );
+        async move { send_stream_delete_request(&url, node, tenant_id, &deletion.id).await }
+    }))
+    .await;
+    for result in results {
+        result?;
+    }
+    Ok(())
+}
+
+fn deletion_participants(
+    nodes: &[IngestorMetadata],
+    deletion: &crate::storage::object_storage::StreamDeletionTombstone,
+) -> Result<Vec<IngestorMetadata>, StreamError> {
+    let mut participants = Vec::new();
+    for id in &deletion.ingestor_ids {
+        let node = nodes
+            .iter()
+            .find(|node| &node.node_id == id)
+            .ok_or_else(|| StreamError::Custom {
+                msg: format!(
+                    "Deletion {} is waiting for deregistered ingestor {id}",
+                    deletion.id
+                ),
+                status: StatusCode::SERVICE_UNAVAILABLE,
+            })?;
+        participants.push(node.clone());
+    }
+    Ok(participants)
+}
+
 pub async fn send_stream_delete_request(
     url: &str,
     ingestor: IngestorMetadata,
+    tenant_id: &Option<String>,
+    deletion_id: &str,
 ) -> Result<(), StreamError> {
-    if !utils::check_liveness(&ingestor.domain_name).await {
-        return Ok(());
-    }
-    let resp = INTRA_CLUSTER_CLIENT
-        .delete(url)
-        .header(header::CONTENT_TYPE, "application/json")
-        .header(header::AUTHORIZATION, ingestor.token)
-        .send()
-        .await
-        .map_err(|err| {
-            // log the error and return a custom error
-            error!(
-                "Fatal: failed to delete stream: {}\n Error: {:?}",
-                ingestor.domain_name, err
-            );
-            StreamError::Network(err)
-        })?;
+    use crate::storage::object_storage::STREAM_DELETION_ID_HEADER;
 
-    // if the response is not successful, log the error and return a custom error
-    // this could be a bit too much, but we need to be sure it covers all cases
-    if !resp.status().is_success() {
-        error!(
-            "failed to delete stream: {}\nResponse Returned: {:?}",
-            ingestor.domain_name,
-            resp.text().await
+    let mut request = INTRA_CLUSTER_CLIENT
+        .delete(url)
+        .header(header::AUTHORIZATION, ingestor.token)
+        .header(STREAM_DELETION_ID_HEADER, deletion_id);
+    if let Some(tenant_id) = tenant_id {
+        request = request.header(crate::handlers::TENANT_ID, tenant_id);
+    }
+    let response = request.send().await?;
+    validate_deletion_acknowledgement(response.status(), response.headers(), deletion_id)
+}
+
+fn validate_deletion_acknowledgement(
+    status: reqwest::StatusCode,
+    headers: &reqwest::header::HeaderMap,
+    deletion_id: &str,
+) -> Result<(), StreamError> {
+    use crate::storage::object_storage::STREAM_DELETION_ID_HEADER;
+
+    if status != reqwest::StatusCode::ACCEPTED
+        || headers
+            .get(STREAM_DELETION_ID_HEADER)
+            .and_then(|id| id.to_str().ok())
+            != Some(deletion_id)
+    {
+        return Err(StreamError::Custom {
+            msg: format!("Ingestor did not acknowledge deletion {deletion_id}: HTTP {status}"),
+            status: StatusCode::SERVICE_UNAVAILABLE,
+        });
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod deletion_acknowledgement_tests {
+    use super::*;
+    use crate::storage::object_storage::{STREAM_DELETION_ID_HEADER, StreamDeletionTombstone};
+
+    #[test]
+    fn deletion_acknowledgement_requires_matching_id_and_accepted_status() {
+        let mut headers = reqwest::header::HeaderMap::new();
+        assert!(
+            validate_deletion_acknowledgement(reqwest::StatusCode::ACCEPTED, &headers, "current")
+                .is_err()
+        );
+        headers.insert(STREAM_DELETION_ID_HEADER, "old".parse().unwrap());
+        assert!(
+            validate_deletion_acknowledgement(reqwest::StatusCode::ACCEPTED, &headers, "current")
+                .is_err()
+        );
+        headers.insert(STREAM_DELETION_ID_HEADER, "current".parse().unwrap());
+        for status in [
+            reqwest::StatusCode::NOT_FOUND,
+            reqwest::StatusCode::INTERNAL_SERVER_ERROR,
+            reqwest::StatusCode::OK,
+        ] {
+            assert!(validate_deletion_acknowledgement(status, &headers, "current").is_err());
+        }
+        assert!(
+            validate_deletion_acknowledgement(reqwest::StatusCode::ACCEPTED, &headers, "current")
+                .is_ok()
         );
     }
 
-    Ok(())
+    fn node(id: &str) -> IngestorMetadata {
+        IngestorMetadata::new(
+            "8000".to_owned(),
+            "http://127.0.0.1:8000/".to_owned(),
+            "bucket".to_owned(),
+            "user",
+            "password",
+            id.to_owned(),
+            "8002".to_owned(),
+            None,
+            NodeType::Ingestor,
+        )
+    }
+
+    #[test]
+    fn deletion_acknowledgement_keeps_deregistered_participants_required() {
+        let deletion = StreamDeletionTombstone::new(vec!["offline".to_owned()]);
+        assert!(deletion_participants(&[], &deletion).is_err());
+        assert!(deletion_participants(&[node("other")], &deletion).is_err());
+        let restored: StreamDeletionTombstone =
+            serde_json::from_slice(&serde_json::to_vec(&deletion).unwrap()).unwrap();
+        assert!(deletion_participants(&[], &restored).is_err());
+    }
+
+    #[test]
+    fn deletion_acknowledgement_does_not_filter_unreachable_nodes() {
+        let nodes = [node("offline"), node("online")];
+        let deletion =
+            StreamDeletionTombstone::new(vec!["offline".to_owned(), "online".to_owned()]);
+        let participants = deletion_participants(&nodes, &deletion).unwrap();
+        assert_eq!(participants.len(), 2);
+        assert_eq!(participants[0].node_id, "offline");
+    }
 }
 
 /// send a retention cleanup request to all ingestors

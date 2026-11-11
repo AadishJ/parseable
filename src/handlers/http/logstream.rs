@@ -73,7 +73,6 @@ pub async fn delete(
     // deletion and permit recreation while this handler still has cleanup left.
     let _creation_guard = CREATE_STREAM_LOCK.lock().await;
     let stream = {
-
         if !PARSEABLE
             .check_or_load_stream(&stream_name, &tenant_id)
             .await
@@ -91,6 +90,7 @@ pub async fn delete(
             )
             .await?
             {
+                spawn_stream_deletion(stream_name.clone(), tenant_id.clone());
                 return Ok((
                     format!("log stream {stream_name} deletion already in progress"),
                     StatusCode::ACCEPTED,
@@ -103,13 +103,23 @@ pub async fn delete(
 
         // Do not rewrite an existing deletion's tombstone: a failed rewrite
         // would otherwise reach clear_deleting() and re-enable ingestion.
-        if stream.is_deleting() {
+        if stream.is_deleting()
+            || is_tombstoned(
+                PARSEABLE.storage.get_object_store().as_ref(),
+                &stream_name,
+                &tenant_id,
+            )
+            .await?
+        {
+            stream.mark_deleting();
+            spawn_stream_deletion(stream_name.clone(), tenant_id.clone());
             return Ok((
                 format!("log stream {stream_name} deletion already in progress"),
                 StatusCode::ACCEPTED,
             ));
         }
 
+        let deletion = super::cluster::new_stream_deletion(&tenant_id).await?;
         // Reject new local ingestion before awaiting the durable tombstone.
         // Existing operations are drained by remove_staging() below.
         stream.mark_deleting();
@@ -122,7 +132,7 @@ pub async fn delete(
         if let Err(e) = objectstore
             .put_object(
                 &tombstone_path(&stream_name, &tenant_id),
-                to_bytes(&()),
+                to_bytes(&deletion),
                 &tenant_id,
             )
             .await
@@ -766,7 +776,6 @@ pub async fn get_stream_hot_tier_internal(
     {
         return Err(StreamNotFound(stream_name.to_owned()).into());
     }
-
 
     let Some(hot_tier_manager) = GLOBAL_HOTTIER.get() else {
         return Err(StreamError::HotTierNotEnabled(stream_name.to_owned()));

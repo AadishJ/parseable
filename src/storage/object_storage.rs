@@ -42,8 +42,8 @@ use arrow_schema::Schema;
 use async_trait::async_trait;
 use bytes::Bytes;
 use chrono::{DateTime, Utc};
-use dashmap::{DashMap, DashSet};
 use dashmap::mapref::entry::Entry;
+use dashmap::{DashMap, DashSet};
 use datafusion::{datasource::listing::ListingTableUrl, execution::runtime_env::RuntimeEnvBuilder};
 use itertools::Itertools;
 use object_store::ListResult;
@@ -107,10 +107,11 @@ pub(crate) struct UploadContext {
     stream: Arc<Stream>,
     custom_partition: Option<String>,
     schema: Arc<Schema>,
+    upload_guard: Arc<tokio::sync::OwnedRwLockReadGuard<()>>,
 }
 
 impl UploadContext {
-    fn new(stream: Arc<Stream>) -> Self {
+    fn new(stream: Arc<Stream>, upload_guard: tokio::sync::OwnedRwLockReadGuard<()>) -> Self {
         let custom_partition = stream.get_custom_partition();
         let schema = stream.get_schema();
 
@@ -118,6 +119,7 @@ impl UploadContext {
             stream,
             custom_partition,
             schema,
+            upload_guard: Arc::new(upload_guard),
         }
     }
 }
@@ -1073,7 +1075,10 @@ pub trait ObjectStorage: Debug + Send + Sync + 'static {
         info!("Starting object_store_sync for stream- {stream_name}");
 
         let stream = PARSEABLE.get_stream(stream_name, &tenant_id)?;
-        let upload_context = UploadContext::new(stream);
+        let Some(upload_guard) = stream.upload_guard().await else {
+            return Ok(());
+        };
+        let upload_context = UploadContext::new(stream, upload_guard);
 
         // Process parquet files concurrently and collect results
         let uploaded_files =
@@ -1195,9 +1200,11 @@ async fn spawn_parquet_upload_task(
     );
 
     let stream_name = stream_name.to_string();
+    let upload_guard = Arc::clone(&upload_context.upload_guard);
     let handle = FLUSH_AND_CONVERT_RUNTIME.handle();
     join_set.spawn_on(
         async move {
+            let _upload_guard = upload_guard;
             let _permit = semaphore.acquire().await.expect("semaphore is not closed");
 
             upload_single_parquet_file(store, path, stream_relative_path, stream_name, tenant_id)
@@ -1212,6 +1219,7 @@ async fn collect_upload_results(
     mut join_set: JoinSet<Result<UploadResult, (PathBuf, ObjectStorageError)>>,
 ) -> Result<Vec<UploadedParquetFile>, ObjectStorageError> {
     let mut uploaded_files = Vec::new();
+    let mut first_error = None;
 
     while let Some(result) = join_set.join_next().await {
         match result {
@@ -1233,15 +1241,23 @@ async fn collect_upload_results(
             Ok(Err((path, e))) => {
                 error!("Error uploading parquet file: {e}");
                 ACTIVE_OBJECT_STORE_SYNC_FILES.remove(&path);
-                return Err(e);
+                first_error.get_or_insert(e);
             }
             Err(e) => {
                 error!("Task panicked: {e}");
-                return Err(ObjectStorageError::UnhandledError(Box::new(e)));
+                first_error.get_or_insert(ObjectStorageError::UnhandledError(Box::new(e)));
             }
         }
     }
 
+    if let Some(err) = first_error {
+        // No snapshot was published for these successful uploads. Release their
+        // claims so the staged files can be retried instead of waiting for expiry.
+        for uploaded in uploaded_files {
+            ACTIVE_OBJECT_STORE_SYNC_FILES.remove(&uploaded.file_path);
+        }
+        return Err(err);
+    }
     Ok(uploaded_files)
 }
 
@@ -1385,6 +1401,81 @@ fn stream_relative_path(
     }
 }
 
+pub const STREAM_DELETION_ID_HEADER: &str = "x-parseable-deletion-id";
+
+/// The participant set survives retries, restarts, and node deregistration.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+pub struct StreamDeletionTombstone {
+    pub id: String,
+    pub ingestor_ids: Vec<String>,
+    #[serde(default)]
+    pub participants_sealed: bool,
+}
+
+impl StreamDeletionTombstone {
+    pub fn new(ingestor_ids: Vec<String>) -> Self {
+        Self {
+            id: Ulid::new().to_string(),
+            ingestor_ids,
+            participants_sealed: false,
+        }
+    }
+
+    fn seal_participants(&mut self, ingestor_ids: Vec<String>) {
+        self.ingestor_ids.extend(ingestor_ids);
+        self.ingestor_ids.sort();
+        self.ingestor_ids.dedup();
+        self.participants_sealed = true;
+    }
+}
+
+pub async fn read_stream_deletion(
+    storage: &(impl ObjectStorage + ?Sized),
+    stream_name: &str,
+    tenant_id: &Option<String>,
+) -> Result<Option<Bytes>, ObjectStorageError> {
+    match storage
+        .get_object(&tombstone_path(stream_name, tenant_id), tenant_id)
+        .await
+    {
+        Ok(bytes) => Ok(Some(bytes)),
+        Err(ObjectStorageError::NoSuchKey(_)) => Ok(None),
+        Err(ObjectStorageError::IoError(err)) if err.kind() == std::io::ErrorKind::NotFound => {
+            Ok(None)
+        }
+        Err(err) => Err(err),
+    }
+}
+
+/// Called with the mode's creation lock held. Missing resident metadata is not
+/// an acknowledgement until leftover staging has also been removed.
+pub async fn prepare_stream_deletion(
+    stream_name: &str,
+    tenant_id: &Option<String>,
+) -> Result<(), crate::parseable::StagingError> {
+    if let Ok(stream) = PARSEABLE.get_stream(stream_name, tenant_id) {
+        stream.mark_deleting();
+        return stream.remove_staging(tenant_id).await;
+    }
+
+    let path = PARSEABLE
+        .options
+        .local_stream_data_path(stream_name, tenant_id);
+    let stream_name = stream_name.to_owned();
+    let tenant_id = tenant_id.clone();
+    tokio::task::spawn_blocking(move || -> Result<(), crate::parseable::StagingError> {
+        match std::fs::remove_dir_all(path) {
+            Ok(()) => {}
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+            Err(err) => return Err(err.into()),
+        }
+        stats::delete_stats(&stream_name, "json", &tenant_id).map_err(std::io::Error::other)?;
+        Ok(())
+    })
+    .await
+    .map_err(|err| std::io::Error::other(format!("Staging cleanup task failed: {err}")))?
+}
+
 /// Dedupes concurrent background deletion jobs for the same (tenant, stream)
 /// so a repeat DELETE request, or a restart-triggered resume racing a job
 /// already spawned before the restart, can't run `delete_stream` twice
@@ -1427,7 +1518,7 @@ pub fn spawn_stream_deletion(stream_name: String, tenant_id: Option<String>) {
         let _guard = StreamDeletionGuard(Some(key.clone()));
         let (tenant_id, stream_name) = &key;
         let storage = PARSEABLE.storage.get_object_store();
-        {
+        let (deletion, marker) = {
             let creation_lock = if PARSEABLE.options.mode == Mode::Query {
                 &crate::handlers::http::modal::query::querier_logstream::CREATE_STREAM_LOCK
             } else {
@@ -1435,88 +1526,134 @@ pub fn spawn_stream_deletion(stream_name: String, tenant_id: Option<String>) {
             };
             let _creation_guard = creation_lock.lock().await;
 
-            match is_tombstoned(storage.as_ref(), stream_name, tenant_id).await {
-                Ok(true) => {}
-                Ok(false) => return,
-                Err(err) => {
-                    warn!("failed to check deletion tombstone for {stream_name}: {err}");
+            let mut marker =
+                match read_stream_deletion(storage.as_ref(), stream_name, tenant_id).await {
+                    Ok(Some(marker)) => marker,
+                    Ok(None) => return,
+                    Err(err) => {
+                        warn!("failed to read deletion tombstone for {stream_name}: {err}");
+                        return;
+                    }
+                };
+            let mut deletion =
+                match serde_json::from_slice::<Option<StreamDeletionTombstone>>(&marker) {
+                    Ok(Some(deletion)) => deletion,
+                    Ok(None) => StreamDeletionTombstone::new(Vec::new()),
+                    Err(err) => {
+                        warn!("invalid deletion marker for {stream_name}: {err}");
+                        return;
+                    }
+                };
+            if !deletion.participants_sealed {
+                // Include nodes registered between the initial snapshot and the
+                // durable marker. Later joiners see the marker during startup.
+                let snapshot = match crate::handlers::http::cluster::new_stream_deletion(tenant_id)
+                    .await
+                {
+                    Ok(snapshot) => snapshot,
+                    Err(err) => {
+                        warn!("failed to discover deletion participants for {stream_name}: {err}");
+                        return;
+                    }
+                };
+                deletion.seal_participants(snapshot.ingestor_ids);
+                marker = to_bytes(&deletion);
+                if let Err(err) = storage
+                    .put_object(
+                        &tombstone_path(stream_name, tenant_id),
+                        marker.clone(),
+                        tenant_id,
+                    )
+                    .await
+                {
+                    warn!("failed to persist deletion participants for {stream_name}: {err}");
                     return;
                 }
             }
 
-            let cleanup: Result<(), crate::parseable::StagingError> =
-                match PARSEABLE.get_stream(stream_name, tenant_id) {
-                    Ok(stream) => {
-                        stream.mark_deleting();
-                        stream.remove_staging(tenant_id).await
-                    }
-                    Err(_) => {
-                        // Recovery may have no resident Stream to clean through.
-                        let path = PARSEABLE
-                            .options
-                            .local_stream_data_path(stream_name, tenant_id);
-
-                        match tokio::fs::remove_dir_all(path).await {
-                            Ok(()) => Ok(()),
-                            Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
-                            Err(err) => Err(err.into()),
-                        }
-                    }
-                };
-
-            if let Err(err) = cleanup {
+            if let Err(err) = prepare_stream_deletion(stream_name, tenant_id).await {
                 warn!(
                     "failed to clean staging for deleting stream {stream_name}: \
                      {err}; retaining tombstone for retry"
                 );
                 return;
             }
-        }
-        match storage.delete_stream(stream_name, tenant_id).await {
-            Ok(()) => {
-                // Clear the map entry and stats *before* the tombstone, not
-                // after: while the tombstone is still present, any
-                // concurrent create/update for this name is rejected with
-                // 409 by reject_if_stream_deleting's own tombstone check, so
-                // nothing can have recreated this name yet. Clearing the
-                // tombstone first would open a window where a legitimate
-                // recreate succeeds before this cleanup runs -- harmless for
-                // the map entry itself (delete_if_still_deleting only
-                // touches an entry still flagged deleting), but
-                // stats::delete_stats has no such per-entry guard and would
-                // zero out the freshly recreated stream's stats instead.
+            (deletion, marker)
+        };
+        let acknowledgements = async {
+            crate::handlers::http::cluster::acknowledge_stream_deletion(
+                stream_name,
+                tenant_id,
+                &deletion,
+            )
+            .await
+            .map_err(|err| ObjectStorageError::Custom(err.to_string()))
+        };
+        if let Err(err) = finish_stream_deletion(
+            storage.as_ref(),
+            stream_name,
+            tenant_id,
+            &marker,
+            acknowledgements,
+            || {
+                // Keep the marker until local state is cleared, so recreation
+                // cannot inherit or lose counters from the previous stream.
+                stats::delete_stats(stream_name, "json", tenant_id)
+                    .map_err(std::io::Error::other)?;
                 PARSEABLE
                     .streams
                     .delete_if_still_deleting(stream_name, tenant_id);
-                if let Err(e) = stats::delete_stats(stream_name, "json", tenant_id) {
-                    warn!("failed to clear stats for deleted stream {stream_name}: {e:?}");
-                }
-                if let Err(e) = storage
-                    .delete_object(&tombstone_path(stream_name, tenant_id), tenant_id)
-                    .await
-                {
-                    warn!(
-                        "background deletion of {stream_name} finished but failed to clear its tombstone: {e}"
-                    );
-                }
-            }
-            Err(e) => error!(
-                "background deletion failed for {stream_name}: {e}. tombstone left in place, retried on next restart or repeat DELETE"
-            ),
+                Ok(())
+            },
+        )
+        .await
+        {
+            warn!(
+                "deletion of {stream_name} remains pending: {err}; retrying on reconciliation or repeat DELETE"
+            );
         }
     });
 }
 
-// Extracted out of sync_all_streams to keep its own cyclomatic complexity
-// down -- this owns just the "this node already knows the stream is
-// deleting" branch. It received the DELETE handler's `for_each_live_node`
-// push directly, or it's the owning node itself resuming its own in-flight
-// job after a restart. A node that missed the fan-out push entirely (e.g. it
-// was down or transiently unreachable at that exact moment) never gets
-// is_deleting()=true set in the first place, so it never reaches this
-// function at all -- that case is instead caught by
-// spawn_tombstone_directory_reconciliation, which doesn't depend on the flag
-// already being set locally.
+async fn finish_stream_deletion(
+    storage: &dyn ObjectStorage,
+    stream_name: &str,
+    tenant_id: &Option<String>,
+    marker: &Bytes,
+    acknowledgements: impl std::future::Future<Output = Result<(), ObjectStorageError>>,
+    finalize_local_state: impl FnOnce() -> Result<(), ObjectStorageError>,
+) -> Result<(), ObjectStorageError> {
+    if read_stream_deletion(storage, stream_name, tenant_id)
+        .await?
+        .as_ref()
+        != Some(marker)
+    {
+        return Err(ObjectStorageError::Custom(
+            "Deletion marker changed before the initial sweep".to_owned(),
+        ));
+    }
+    // Reclaim existing data even if an ingestor is offline. The marker remains
+    // until acknowledgements and a second sweep remove any late uploads.
+    storage.delete_stream(stream_name, tenant_id).await?;
+    acknowledgements.await?;
+    if read_stream_deletion(storage, stream_name, tenant_id)
+        .await?
+        .as_ref()
+        != Some(marker)
+    {
+        return Err(ObjectStorageError::Custom(
+            "Deletion marker changed while waiting for acknowledgements".to_owned(),
+        ));
+    }
+    storage.delete_stream(stream_name, tenant_id).await?;
+    finalize_local_state()?;
+    storage
+        .delete_object(&tombstone_path(stream_name, tenant_id), tenant_id)
+        .await
+}
+
+// Retry known deletions on their owner, and evict cleaned ingestor entries
+// after completion. Missing acknowledgements retain the durable tombstone.
 fn spawn_deleting_stream_reconciliation(
     joinset: &mut JoinSet<Result<(), ObjectStorageError>>,
     handle: &tokio::runtime::Handle,
@@ -1524,14 +1661,8 @@ fn spawn_deleting_stream_reconciliation(
     tenant_id: Option<String>,
     stream_name: String,
 ) {
-    // Only a node type that can actually receive a client's original DELETE
-    // request (query/standalone) ever resumes the physical delete here. An
-    // ingestor only ever gets is_deleting()=true via the delete handler's
-    // own fan-out push, which never starts a job on the ingestor itself --
-    // letting it also spawn one here would mean every ingestor independently
-    // runs a redundant, uncoordinated bulk delete against the same prefix
-    // for the entire (possibly long) duration of every deletion, not just
-    // the rare case of a genuinely missed notification.
+    // Ingestors prepare and acknowledge deletion; only query/standalone nodes
+    // run the final bulk delete after all required acknowledgements.
     let is_deletion_owner = PARSEABLE.options.mode != Mode::Ingest;
     joinset.spawn_on(
         async move {
@@ -1591,12 +1722,10 @@ fn spawn_deleting_stream_reconciliation(
 // its own, since it only acts on a stream whose local is_deleting() is
 // already true:
 //  - A resident stream that's still flagged false because this node never
-//    ran mark_deleting() on it at all -- e.g. an ingestor that missed the
-//    DELETE handler's `for_each_live_node` fan-out push (a transient
-//    liveness-check failure at the wrong instant is enough), so it kept
-//    accepting ingestion into an already-deleted stream indefinitely.
-//    Flagging it here is just an in-memory update, so this runs on every
-//    node type, not only the owner.
+//    ran mark_deleting() on it at all -- e.g. an ingestor still awaiting
+//    the deletion worker's preparation request. The worker cannot finalize
+//    deletion until that participant has acknowledged.
+//    Local preparation runs on every node type, not only the owner.
 //  - A stream already gone from this node's memory entirely because its
 //    owning deletion job already finished, but whose final tombstone-clear
 //    call failed (e.g. a transient network error) -- only the owner should
@@ -2131,6 +2260,253 @@ mod tombstone_tests {
                 .unwrap()
                 .is_empty()
         );
+    }
+}
+
+#[cfg(test)]
+mod deletion_acknowledgement_tests {
+    use super::*;
+    use crate::storage::LocalFS;
+    use temp_dir::TempDir;
+
+    async fn pending_deletion() -> (TempDir, LocalFS, Bytes) {
+        let dir = TempDir::new().unwrap();
+        let storage = LocalFS::new(dir.path().to_path_buf());
+        let mut deletion = StreamDeletionTombstone::new(vec!["ingestor".to_owned()]);
+        deletion.seal_participants(Vec::new());
+        let marker = to_bytes(&deletion);
+        storage
+            .put_object(&tombstone_path("stream", &None), marker.clone(), &None)
+            .await
+            .unwrap();
+        storage
+            .put_object(
+                RelativePath::new("stream/data.parquet"),
+                Bytes::from_static(b"data"),
+                &None,
+            )
+            .await
+            .unwrap();
+        (dir, storage, marker)
+    }
+
+    #[tokio::test]
+    async fn deletion_acknowledgement_upload_error_drains_remaining_tasks() {
+        let release = Arc::new(tokio::sync::Notify::new());
+        let drained = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let mut tasks = JoinSet::new();
+        tasks.spawn(async {
+            Err((
+                PathBuf::from("failed-upload"),
+                ObjectStorageError::Custom("failed".to_owned()),
+            ))
+        });
+        let task_release = Arc::clone(&release);
+        let task_drained = Arc::clone(&drained);
+        tasks.spawn(async move {
+            task_release.notified().await;
+            task_drained.store(true, std::sync::atomic::Ordering::SeqCst);
+            Err((
+                PathBuf::from("drained-upload"),
+                ObjectStorageError::Custom("drained".to_owned()),
+            ))
+        });
+        let observer = async {
+            tokio::task::yield_now().await;
+            release.notify_one();
+        };
+        let (result, ()) = tokio::join!(collect_upload_results(tasks), observer);
+        assert!(result.is_err());
+        assert!(drained.load(std::sync::atomic::Ordering::SeqCst));
+    }
+
+    #[test]
+    fn deletion_acknowledgement_sealing_retains_removed_and_new_participants() {
+        let mut deletion =
+            StreamDeletionTombstone::new(vec!["removed".to_owned(), "present".to_owned()]);
+        let id = deletion.id.clone();
+        deletion.seal_participants(vec!["present".to_owned(), "joined".to_owned()]);
+        assert_eq!(deletion.id, id);
+        assert_eq!(deletion.ingestor_ids, vec!["joined", "present", "removed"]);
+        assert!(deletion.participants_sealed);
+        let restored: StreamDeletionTombstone =
+            serde_json::from_slice(&to_bytes(&deletion)).unwrap();
+        assert_eq!(restored, deletion);
+    }
+
+    #[tokio::test]
+    async fn deletion_acknowledgement_failure_preserves_marker_after_initial_sweep() {
+        let (dir, storage, marker) = pending_deletion().await;
+        let result = finish_stream_deletion(
+            &storage,
+            "stream",
+            &None,
+            &marker,
+            async { Err(ObjectStorageError::Custom("offline ingestor".to_owned())) },
+            || panic!("must not finalize an unacknowledged deletion"),
+        )
+        .await;
+        assert!(result.is_err());
+        assert!(!dir.path().join("stream").exists());
+        assert_eq!(
+            read_stream_deletion(&storage, "stream", &None)
+                .await
+                .unwrap(),
+            Some(marker)
+        );
+    }
+
+    #[tokio::test]
+    async fn deletion_acknowledgement_final_sweep_removes_late_uploads() {
+        let (dir, storage, marker) = pending_deletion().await;
+        let acknowledgements = async {
+            assert!(!dir.path().join("stream").exists());
+            assert!(is_tombstoned(&storage, "stream", &None).await.unwrap());
+            storage
+                .put_object(
+                    RelativePath::new("stream/late.parquet"),
+                    Bytes::from_static(b"late upload"),
+                    &None,
+                )
+                .await?;
+            Ok(())
+        };
+        finish_stream_deletion(&storage, "stream", &None, &marker, acknowledgements, || {
+            assert!(!dir.path().join("stream").exists());
+            assert!(
+                dir.path()
+                    .join(tombstone_path("stream", &None).as_str())
+                    .exists()
+            );
+            Ok(())
+        })
+        .await
+        .unwrap();
+        assert!(!dir.path().join("stream").exists());
+        assert!(!is_tombstoned(&storage, "stream", &None).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn deletion_acknowledgement_for_old_marker_cannot_delete_new_data() {
+        let (_dir, storage, marker) = pending_deletion().await;
+        let replacement = to_bytes(&StreamDeletionTombstone::new(vec![]));
+        let acknowledgements = async {
+            storage
+                .put_object(&tombstone_path("stream", &None), replacement.clone(), &None)
+                .await?;
+            storage
+                .put_object(
+                    RelativePath::new("stream/data.parquet"),
+                    Bytes::from_static(b"replacement data"),
+                    &None,
+                )
+                .await
+        };
+        assert!(
+            finish_stream_deletion(
+                &storage,
+                "stream",
+                &None,
+                &marker,
+                acknowledgements,
+                || panic!("must not finalize another deletion"),
+            )
+            .await
+            .is_err()
+        );
+        assert!(
+            storage
+                .head(RelativePath::new("stream/data.parquet"), &None)
+                .await
+                .is_ok()
+        );
+        assert_eq!(
+            read_stream_deletion(&storage, "stream", &None)
+                .await
+                .unwrap(),
+            Some(replacement)
+        );
+    }
+
+    #[tokio::test]
+    async fn deletion_acknowledgement_stale_job_cannot_start_initial_sweep() {
+        let (dir, storage, marker) = pending_deletion().await;
+        storage
+            .put_object(
+                &tombstone_path("stream", &None),
+                to_bytes(&StreamDeletionTombstone::new(vec![])),
+                &None,
+            )
+            .await
+            .unwrap();
+        let result = finish_stream_deletion(
+            &storage,
+            "stream",
+            &None,
+            &marker,
+            async { panic!("must not request acknowledgements for a stale job") },
+            || panic!("must not finalize a stale job"),
+        )
+        .await;
+        assert!(result.is_err());
+        assert!(dir.path().join("stream/data.parquet").exists());
+    }
+
+    #[tokio::test]
+    async fn deletion_acknowledgement_failed_final_sweep_keeps_marker() {
+        let (_dir, storage, marker) = pending_deletion().await;
+        let acknowledgements = async {
+            // A file at the prefix makes LocalFS's recursive final sweep fail.
+            storage
+                .put_object(
+                    RelativePath::new("stream"),
+                    Bytes::from_static(b"not a directory"),
+                    &None,
+                )
+                .await
+        };
+        assert!(
+            finish_stream_deletion(
+                &storage,
+                "stream",
+                &None,
+                &marker,
+                acknowledgements,
+                || panic!("must not finalize a failed final sweep"),
+            )
+            .await
+            .is_err()
+        );
+        assert_eq!(
+            read_stream_deletion(&storage, "stream", &None)
+                .await
+                .unwrap(),
+            Some(marker)
+        );
+    }
+
+    #[tokio::test]
+    async fn deletion_acknowledgement_retries_cleanup_without_losing_marker() {
+        let (_dir, storage, marker) = pending_deletion().await;
+        assert!(
+            finish_stream_deletion(
+                &storage,
+                "stream",
+                &None,
+                &marker,
+                async { Ok(()) },
+                || Err(ObjectStorageError::Custom("cleanup failed".to_owned())),
+            )
+            .await
+            .is_err()
+        );
+        assert!(is_tombstoned(&storage, "stream", &None).await.unwrap());
+        finish_stream_deletion(&storage, "stream", &None, &marker, async { Ok(()) }, || {
+            Ok(())
+        })
+        .await
+        .unwrap();
+        assert!(!is_tombstoned(&storage, "stream", &None).await.unwrap());
     }
 }
 

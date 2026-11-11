@@ -41,7 +41,6 @@ use crate::{
     handlers::{
         UPDATE_STREAM_KEY,
         http::{
-            base_path_without_preceding_slash,
             cluster::{
                 self, fetch_daily_stats, fetch_stats_from_ingestors, sync_streams_with_ingestors,
                 utils::{IngestionStats, QueriedStats, StorageStats, merge_queried_stats},
@@ -96,6 +95,7 @@ pub async fn delete(
             )
             .await?
             {
+                spawn_stream_deletion(stream_name.clone(), tenant_id.clone());
                 return Ok((
                     format!("log stream {stream_name} deletion already in progress"),
                     StatusCode::ACCEPTED,
@@ -108,14 +108,23 @@ pub async fn delete(
 
         // Do not rewrite an existing deletion's tombstone: failure would reach
         // clear_deleting() and incorrectly roll back another request's deletion.
-        if stream.is_deleting() {
+        if stream.is_deleting()
+            || is_tombstoned(
+                PARSEABLE.storage.get_object_store().as_ref(),
+                &stream_name,
+                &tenant_id,
+            )
+            .await?
+        {
+            stream.mark_deleting();
+            spawn_stream_deletion(stream_name.clone(), tenant_id.clone());
             return Ok((
                 format!("log stream {stream_name} deletion already in progress"),
                 StatusCode::ACCEPTED,
             ));
         }
-        // Block new local operations before awaiting the durable tombstone.
-        // Ingestors receive their own local guard via the notification below.
+        let deletion = cluster::new_stream_deletion(&tenant_id).await?;
+        // Ingestors are drained by the background acknowledgement barrier.
         stream.mark_deleting();
 
         let objectstore = PARSEABLE.storage.get_object_store();
@@ -126,7 +135,7 @@ pub async fn delete(
         if let Err(e) = objectstore
             .put_object(
                 &tombstone_path(&stream_name, &tenant_id),
-                to_bytes(&()),
+                to_bytes(&deletion),
                 &tenant_id,
             )
             .await
@@ -155,24 +164,8 @@ pub async fn delete(
         );
     }
 
-    // Notify live ingestors to stop local ingestion and clean their staging.
-    // Failure is best-effort because deletion is already durable. An ingestor
-    // that misses notification can discover the marker through sync's tombstone
-    // directory scan while the tombstone remains present.
-    let fanout_stream_name = stream_name.clone();
-    if let Err(e) = cluster::for_each_live_node(&tenant_id, move |node| {
-        let url = format!(
-            "{}{}/logstream/{}/sync",
-            node.domain_name,
-            base_path_without_preceding_slash(),
-            fanout_stream_name
-        );
-        async move { cluster::send_stream_delete_request(&url, node).await }
-    })
-    .await
-    {
-        warn!("failed to notify all ingestors of deletion of {stream_name}: {e}");
-    }
+    // The background job requires every recorded ingestor's acknowledgement
+    // before deleting object storage; unavailable nodes keep the tombstone live.
 
     // Drain participating local work and finalize writers before removing this
     // querier's staging. The background job retries local cleanup if it fails.

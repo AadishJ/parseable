@@ -384,6 +384,7 @@ pub struct Stream {
     // Ingestion/local sync hold read access; staging cleanup holds write access.
     // Acquire before schema_writer or writer when an operation needs both.
     staging_activity: RwLock<()>,
+    upload_activity: Arc<tokio::sync::RwLock<()>>,
 }
 
 /// Startup conversion owns this immutable processing-file snapshot. Periodic
@@ -705,6 +706,7 @@ impl Stream {
             schema_writer: Mutex::new(()),
             ingestor_id,
             staging_activity: RwLock::new(()),
+            upload_activity: Arc::new(tokio::sync::RwLock::new(())),
         })
     }
 
@@ -2325,9 +2327,15 @@ impl Stream {
     ) -> Result<(), StagingError> {
         let stream = Arc::clone(self);
         let tenant_id = tenant_id.clone();
-        tokio::task::spawn_blocking(move || stream.remove_staging_blocking(&tenant_id))
-            .await
-            .map_err(|err| std::io::Error::other(format!("Staging cleanup task failed: {err}")))?
+        // Drain uploads, including metadata publication, before acknowledging.
+        // Move the guard into the task so cancellation cannot release it early.
+        let upload_guard = Arc::clone(&self.upload_activity).write_owned().await;
+        tokio::task::spawn_blocking(move || {
+            let _upload_guard = upload_guard;
+            stream.remove_staging_blocking(&tenant_id)
+        })
+        .await
+        .map_err(|err| std::io::Error::other(format!("Staging cleanup task failed: {err}")))?
     }
 
     fn remove_staging_blocking(&self, tenant_id: &Option<String>) -> Result<(), StagingError> {
@@ -2362,14 +2370,18 @@ impl Stream {
 
         // Reset under exclusive activity access so an old Event::process cannot
         // update counters after cleanup has reset them.
-        if let Err(err) = crate::stats::delete_stats(&self.stream_name, "json", tenant_id) {
-            warn!(
-                "failed to clear stats for deleted stream {}: {err}",
-                self.stream_name
-            );
-        }
+        crate::stats::delete_stats(&self.stream_name, "json", tenant_id)
+            .map_err(std::io::Error::other)?;
 
         Ok(())
+    }
+
+    pub(crate) async fn upload_guard(&self) -> Option<tokio::sync::OwnedRwLockReadGuard<()>> {
+        let guard = Arc::clone(&self.upload_activity).read_owned().await;
+        if self.is_deleting() {
+            return None;
+        }
+        Some(guard)
     }
 
     pub fn updated_schema(&self, current_schema: Schema) -> Schema {
@@ -3120,6 +3132,40 @@ mod tests {
     use tokio::time::sleep;
 
     use super::*;
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn deletion_acknowledgement_waits_for_uploads_and_rejects_new_uploads() {
+        let temp_dir = TempDir::new().unwrap();
+        let stream = Stream::new(
+            Arc::new(Options {
+                local_staging_path: temp_dir.path().to_path_buf(),
+                ..Default::default()
+            }),
+            "deletion_upload_drain",
+            LogStreamMetadata::default(),
+            None,
+            &None,
+        );
+        fs::create_dir_all(stream.data_path.parent().unwrap()).unwrap();
+        fs::write(&stream.data_path, b"not a directory").unwrap();
+        let active_upload = stream.upload_guard().await.unwrap();
+        stream.mark_deleting();
+        assert!(stream.upload_guard().await.is_none());
+        let completed = std::cell::Cell::new(false);
+        let cleanup = async {
+            let result = stream.remove_staging(&None).await;
+            completed.set(true);
+            result
+        };
+        let finish_upload = async {
+            tokio::task::yield_now().await;
+            assert!(!completed.get());
+            drop(active_upload);
+        };
+        let (result, ()) = tokio::join!(cleanup, finish_upload);
+        assert!(matches!(result, Err(StagingError::ObjectStorage(_))));
+        assert!(stream.upload_guard().await.is_none());
+    }
 
     #[tokio::test(flavor = "current_thread")]
     async fn remove_staging_wait_does_not_block_async_worker() {
